@@ -103,6 +103,17 @@ services:
     long_description: "Budibase lets you build internal tools and business apps in minutes. Connect to databases (PostgreSQL, MySQL, MongoDB), REST APIs, or use built-in tables. Drag-and-drop UI builder, role-based access control, workflow automation, and self-hosted deployment."
     image: "budibase/budibase:latest"
 
+  chroma:
+    subdomain: "chroma"
+    port: 8099
+    public: false
+    category: "ai-ml"
+    website: "https://www.trychroma.com"
+    description: "Developer-friendly embedding database for LLM and RAG pipelines."
+    long_description: "Chroma is an open-source embedding (vector) database designed for LLM applications. Store text + embeddings, run similarity queries to retrieve the top-k most relevant chunks for a prompt — the workhorse store behind most LangChain / LlamaIndex tutorials. Single container, HTTP REST API, file-based persistence on a local volume. Pairs naturally with Crawl4AI (scrape → embed → index) and Big-AGI / Dify (retrieve → augment prompt)."
+    image: "chromadb/chroma:1.5.9"
+    landing_path: "/docs/"   # API-only — Chroma has no UI at /, but /docs/ serves Swagger
+
   clickhouse:
     subdomain: "clickhouse"
     port: 8123
@@ -134,6 +145,16 @@ services:
     description: "LLM-friendly web crawler that returns clean Markdown for RAG pipelines."
     long_description: "Crawl4AI is an open-source web crawler optimised for LLM workflows. It scrapes pages and returns clean Markdown, JSON, or structured extracts ready for RAG ingestion or LLM prompts. Exposes a REST API and an interactive Playground UI. Pairs naturally with Dify, Big-AGI, or Kestra flows that need to ingest external content. Stateless — no database, in-memory cache only."
     image: "unclecode/crawl4ai:0.8.6"
+
+  cyberchef:
+    subdomain: "cyberchef"
+    port: 8400
+    public: false
+    category: "dev-tools"
+    website: "https://gchq.github.io/CyberChef/"
+    description: "The Cyber Swiss Army Knife — drag-and-drop data manipulation tool for encoding, decoding, hashing, regex, and crypto."
+    long_description: "CyberChef is a web-based tool from GCHQ that lets you chain ~400 operations (encoding, encryption, compression, regex, hashing, format conversion, etc.) into a 'recipe' via drag-and-drop. The container serves static assets only; CyberChef operations execute client-side in the browser. A small number of operations deliberately call external services (DNS-over-HTTPS, HTTP request, URL fetch) — avoid those if you want recipe inputs to stay in the browser process. Useful for quickly decoding JWTs, base64+gzip payloads, inspecting Kafka message bodies, and live demos."
+    image: "mpepping/cyberchef:v10.24.0"
 
   dagster:
     subdomain: "dagster"
@@ -428,7 +449,7 @@ services:
     website: "https://www.metabase.com"
     description: "Open-source business intelligence and analytics tool for data visualization."
     long_description: "Metabase is a business intelligence tool that lets anyone in your organization ask questions about data. Create dashboards with drag-and-drop, write SQL queries with an interactive editor, and share insights. Connects to PostgreSQL, ClickHouse, and 20+ databases with automatic schema discovery."
-    image: "metabase/metabase:v0.58.x"
+    image: "metabase/metabase:v0.60.6.2"
     support_images:
       postgres: "postgres:16-alpine"
 

@@ -266,6 +266,7 @@ class Orchestrator:
                 self._phase_mirror_finalize,
                 self._phase_secret_sync_jupyter,
                 self._phase_secret_sync_marimo,
+                self._phase_secret_sync_code_server,
             ]
             for phase in phases:
                 result = phase(ssh)
@@ -665,9 +666,13 @@ class Orchestrator:
                 status="partial",
                 detail=f"mirrors={len(result.mirrors)} (some failed)",
             )
-        return PhaseResult(
-            name="mirror-setup", status="ok", detail=f"mirrors={len(result.mirrors)}"
-        )
+        # Surface the sync-detail when present so operators can see whether
+        # the upstream fetch actually landed during this spin-up (vs. silently
+        # leaving the fork at a stale commit).
+        detail_parts = [f"mirrors={len(result.mirrors)}"]
+        if result.sync_detail:
+            detail_parts.append(result.sync_detail)
+        return PhaseResult(name="mirror-setup", status="ok", detail=" | ".join(detail_parts))
 
     def _phase_secret_sync(self, ssh: SSHClient, stack: str) -> PhaseResult:
         """Common impl for jupyter + marimo secret-sync."""
@@ -732,6 +737,9 @@ class Orchestrator:
 
     def _phase_secret_sync_marimo(self, ssh: SSHClient) -> PhaseResult:
         return self._phase_secret_sync(ssh, "marimo")
+
+    def _phase_secret_sync_code_server(self, ssh: SSHClient) -> PhaseResult:
+        return self._phase_secret_sync(ssh, "code-server")
 
     # ---------------------------------------------------------------------
     # Pre-bootstrap pipeline phases.
