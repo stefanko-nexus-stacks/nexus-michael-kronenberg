@@ -208,13 +208,174 @@ def _render_infisical(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
     )
 
 
-def _render_grafana(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+_PROMETHEUS_REMOTE_WRITE_PLACEHOLDER = "# {{ REMOTE_WRITE_BLOCK }}"
+
+
+def _render_prometheus_remote_write_block(e: BootstrapEnv) -> str:
+    """Build the Prometheus ``remote_write`` config block for the
+    grafana stack's prometheus.yml, or a no-op comment when the
+    monitoring env vars are unset.
+
+    Two guards must BOTH hold for an active ``remote_write`` block:
+    (1) endpoint set, (2) token set. Either missing → the block becomes
+    a single-line ``# remote_write disabled`` comment so Prometheus
+    happily starts with today's behaviour. This is the
+    backwards-compatibility contract from #607: existing stacks
+    without Conductor-injected secrets see zero behaviour change.
+    (``tenant_id`` is NOT a guard — it has a domain fallback at
+    render time, so an unset tenant_id never disables the block.)
+
+    SECURITY: the Bearer token lives inline in the rendered
+    prometheus.yml. The file is mode 0o644 (must be readable by the
+    non-root Prometheus container process — see :func:`_render_grafana`);
+    secrecy rests on the host-access barrier (SSH behind CF Tunnel +
+    email OTP). Tenant-label injection happens at the central vmauth
+    proxy server-side; the relabel rule below is informational
+    defense-in-depth (a malicious tenant can NOT use it to spoof
+    another tenant's bucket).
+
+    CARDINALITY: the ``go_*`` / ``process_*`` / ``promhttp_*`` drop
+    relabel is the highest-priority cardinality defuse from
+    Nexus-Conductor #23 — those series are useless for cross-stack
+    monitoring and inflate the central VM's series count per stack.
+    """
+    endpoint = (e.monitoring_endpoint or "").strip()
+    token = (e.monitoring_token or "").strip()
+    if not endpoint or not token:
+        return "# remote_write disabled — set MONITORING_ENDPOINT and MONITORING_TOKEN to enable"
+    # Tenant defaults to the stack's domain when TENANT_ID is unset —
+    # matches Conductor's expectation that each stack maps 1:1 to a
+    # distinct token + tenant pair (its token IS what authorizes the
+    # tenant label assignment at vmauth).
+    tenant = (e.tenant_id or e.domain or "").strip()
+    # Strip trailing slash on the endpoint so we don't end up with
+    # `https://host//api/v1/write` — Prometheus would 404 on that.
+    endpoint = endpoint.rstrip("/")
+    # YAML quoting: emit url / credentials / replacement as JSON-quoted
+    # strings. YAML 1.2 is a JSON superset, so any json.dumps(str)
+    # output is a valid YAML scalar and handles every problematic
+    # character (\" embedded quotes, \\ backslashes, leading {[!,
+    # `: ` mapping separators, trailing `#` comment markers, control
+    # chars). Without this, an operator-supplied endpoint or token
+    # with a YAML-significant character would silently produce an
+    # invalid prometheus.yml — Prometheus would refuse to start with
+    # a parse error pointing at our generated file. Tokens from some
+    # providers contain `=` padding and `_` / `-` which are safe, but
+    # we don't want to hand-audit every possible token format.
+    url_yaml = json.dumps(f"{endpoint}/api/v1/write")
+    token_yaml = json.dumps(token)
+    tenant_yaml = json.dumps(tenant)
+    return (
+        "remote_write:\n"
+        f"  - url: {url_yaml}\n"
+        "    authorization:\n"
+        "      type: Bearer\n"
+        f"      credentials: {token_yaml}\n"
+        "    write_relabel_configs:\n"
+        "      # Cardinality defuse (Conductor #23): drop Prometheus-runtime\n"
+        "      # series that have no value for cross-stack monitoring.\n"
+        "      - source_labels: [__name__]\n"
+        "        regex: '(go_|process_|promhttp_).*'\n"
+        "        action: drop\n"
+        "      # Informational tenant label — vmauth enforces the real one\n"
+        "      # server-side from the token mapping; this is defense-in-depth.\n"
+        "      - target_label: tenant\n"
+        f"        replacement: {tenant_yaml}\n"
+    )
+
+
+def _render_grafana(
+    c: NexusConfig, e: BootstrapEnv, *, prometheus_template: str | None = None
+) -> RenderedEnv:
+    """Grafana env vars + generated ``prometheus.yml`` sidecar.
+
+    Prometheus' YAML config doesn't support env-var substitution in
+    ``remote_write.url`` / ``authorization.credentials`` (only
+    ``external_labels`` + a couple of narrow places, per the
+    Prometheus docs), so the URL + Bearer token must be baked into
+    the config file at render time. We read ``prometheus.yml.template``
+    from the grafana stack dir (the human-editable source) and replace
+    the single ``{{ REMOTE_WRITE_BLOCK }}`` placeholder with either a
+    real ``remote_write`` config or a one-line disabled comment.
+
+    The template file itself is NOT consumed at runtime by Prometheus —
+    only the generated ``prometheus.yml`` (gitignored) is bind-mounted
+    into the container. Re-generated on every spin-up with the current
+    env vars.
+
+    Mode 0o644 (not 0o600 despite the token-in-cleartext): this file
+    is bind-mounted into the prometheus container which runs as a
+    non-root UID — a stricter mode would lock Prometheus itself out
+    of its own config. Token secrecy still rests on the host-access
+    barrier (SSH behind CF Tunnel + email OTP).
+    """
+    # Template content is normally injected by ``render_all_env_files``
+    # via a special-case dispatch (parallel to jupyter's spark_enabled
+    # kwarg) so the template lives under the same ``stacks_dir`` the
+    # rest of the renderer writes into — works with the repo checkout,
+    # with installed wheels (where ``stacks/`` is NOT in the
+    # site-packages), and with non-standard stacks_dir paths (custom
+    # test fixtures). The ``_load_prometheus_template()`` fallback is
+    # kept for direct test callers that invoke ``_render_grafana``
+    # without going through the orchestration layer.
+    template = (
+        prometheus_template if prometheus_template is not None else _load_prometheus_template()
+    )
+    # Fail-fast on template drift: if the placeholder is missing,
+    # str.replace silently no-ops and the renderer would produce a
+    # prometheus.yml without ANY remote_write block — even when the
+    # operator has set MONITORING_ENDPOINT + MONITORING_TOKEN expecting
+    # metrics to flow. Catch this at render time so the deploy aborts
+    # with an actionable message instead of silently failing to push.
+    if _PROMETHEUS_REMOTE_WRITE_PLACEHOLDER not in template:
+        raise ServiceEnvError(
+            "stacks/grafana/prometheus.yml.template is missing the "
+            f"{_PROMETHEUS_REMOTE_WRITE_PLACEHOLDER!r} placeholder — "
+            "remote_write rendering can't proceed. Restore the placeholder "
+            "(usually at the very bottom of the template) or revert local "
+            "edits to that file. Aborting to avoid a silent monitoring-off "
+            "deploy.",
+        )
+    remote_write_block = _render_prometheus_remote_write_block(e)
+    prometheus_yml = template.replace(
+        _PROMETHEUS_REMOTE_WRITE_PLACEHOLDER, remote_write_block.rstrip("\n")
+    )
     return RenderedEnv(
         env_vars={
             "GRAFANA_ADMIN_USER": c.admin_username or "admin",
             "GRAFANA_ADMIN_PASSWORD": c.grafana_admin_password or "",
         },
+        sidecars=(
+            # mode 0o644: this file is bind-mounted INTO the prometheus
+            # container (see stacks/grafana/docker-compose.yml's
+            # `./prometheus.yml:/etc/prometheus/prometheus.yml:ro`), and
+            # the prom/prometheus image runs as a non-root UID (65534
+            # since 2.x). A 0o600 file owned by the host deploy user
+            # would be unreadable inside the container, causing
+            # Prometheus to fail to start with "permission denied".
+            # The Bearer token in this file is still protected by:
+            # (a) host-level access requires SSH which is locked behind
+            # the Cloudflare Tunnel + email OTP, (b) the same token is
+            # already pushed to Infisical + lives in Actions secrets —
+            # the file is not the only place it exists. Matches the
+            # mode of other bind-mounted configs in this stack
+            # (loki-config.yml, promtail-config.yml).
+            SidecarFile(relative_path="prometheus.yml", content=prometheus_yml, mode=0o644),
+        ),
     )
+
+
+def _load_prometheus_template() -> str:
+    """Load ``stacks/grafana/prometheus.yml.template`` from the repo.
+
+    Resolved relative to this Python file: the package layout has
+    ``src/nexus_deploy/service_env.py`` and ``stacks/grafana/...`` as
+    siblings under the project root. Tests can monkey-patch this
+    function to inject a fixture template.
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    template_path = project_root / "stacks" / "grafana" / "prometheus.yml.template"
+    return template_path.read_text(encoding="utf-8")
 
 
 def _render_dagster(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
@@ -241,6 +402,223 @@ def _render_cloudbeaver(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
             "CB_ADMIN_PASSWORD": c.cloudbeaver_admin_password or "",
         },
     )
+
+
+def _render_meilisearch(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+    """Meilisearch: MEILI_MASTER_KEY gates ALL API endpoints (read +
+    write + admin). CF Access at the edge is the outer perimeter; the
+    master key is the inner per-request auth Meilisearch's own
+    admin/data endpoints check.
+
+    Fail-fast guard (same pattern as SFTPGo): if the master key is
+    empty/missing we raise instead of silently writing an empty
+    MEILI_MASTER_KEY into the .env. Without it Meilisearch with
+    MEILI_ENV=production refuses to start, so silent-empty would
+    produce a container that restart-loops with a cryptic error
+    instead of a clear deploy-time failure pointing at the missing
+    Tofu/Infisical sync. Most common cause for an empty key on an
+    existing deploy: spin-up was run before initial-setup applied
+    the new random_password.meilisearch_master_key resource —
+    operator needs to `tofu apply` the stack module first."""
+    if _empty(c.meilisearch_master_key):
+        raise ServiceEnvError(
+            "Meilisearch enabled but MEILI_MASTER_KEY is empty — run "
+            "`tofu apply` (initial-setup workflow) to generate "
+            "random_password.meilisearch_master_key + push to Infisical, "
+            "then re-run spin-up. Aborting to avoid a restart-looping "
+            "container with no auth.",
+        )
+    return RenderedEnv(env_vars={"MEILI_MASTER_KEY": c.meilisearch_master_key or ""})
+
+
+def _render_hedgedoc(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+    """HedgeDoc: needs CMD_DOMAIN (composed from BootstrapEnv.domain
+    + subdomain_separator), the random_password-backed session
+    secret, and a dedicated Postgres password. The admin email +
+    password used by the services-configure hook to seed the
+    admin account are NOT rendered into ``.env`` — the hook reads
+    them straight from :class:`NexusConfig` /
+    :class:`BootstrapEnv`, and the docker-compose doesn't reference
+    them either. We still guard their non-emptyness here so the
+    failure mode (locked-out HedgeDoc with no admin) surfaces at
+    the same deploy phase as the other missing secrets, with one
+    actionable error message for the operator.
+
+    Infisical naming reference (operators grepping the error
+    message should find these keys directly):
+
+    - ``/hedgedoc/HEDGEDOC_SESSION_SECRET`` — empty → HedgeDoc
+      generates one at runtime and rotates it on every container
+      restart, silently logging users out.
+    - ``/hedgedoc/HEDGEDOC_DB_PASSWORD`` — empty → dedicated
+      Postgres init crashes with a cryptic auth error.
+    - ``/hedgedoc/HEDGEDOC_PASSWORD`` — empty → services-configure
+      hook seeds an account with empty password, and with
+      CMD_ALLOW_EMAIL_REGISTER=false (the post-#618 default)
+      that leaves HedgeDoc with no way to log in at all.
+    - ``/hedgedoc/HEDGEDOC_USERNAME`` (=BootstrapEnv.admin_email)
+      — same failure mode as empty password.
+    """
+    missing = []
+    if _empty(c.hedgedoc_session_secret):
+        missing.append("HEDGEDOC_SESSION_SECRET (Infisical /hedgedoc)")
+    if _empty(c.hedgedoc_db_password):
+        missing.append("HEDGEDOC_DB_PASSWORD (Infisical /hedgedoc)")
+    if _empty(c.hedgedoc_admin_password):
+        missing.append("HEDGEDOC_PASSWORD (Infisical /hedgedoc)")
+    if _empty(e.admin_email):
+        missing.append("HEDGEDOC_USERNAME (Infisical /hedgedoc, = BootstrapEnv.admin_email)")
+    if missing:
+        raise ServiceEnvError(
+            f"HedgeDoc enabled but {', '.join(missing)} empty — run "
+            "`tofu apply` (initial-setup workflow) to generate "
+            "random_password.hedgedoc_session_secret + "
+            "random_password.hedgedoc_db_password + "
+            "random_password.hedgedoc_admin "
+            "+ push to Infisical, then re-run spin-up. Aborting to avoid "
+            "an insecure-sessions / DB-auth-failure / lockout container.",
+        )
+    domain_host = service_host("hedgedoc", e.domain or "", e.subdomain_separator)
+    return RenderedEnv(
+        env_vars={
+            "HEDGEDOC_SESSION_SECRET": c.hedgedoc_session_secret or "",
+            "HEDGEDOC_DB_PASSWORD": c.hedgedoc_db_password or "",
+            "HEDGEDOC_DOMAIN": domain_host,
+        },
+    )
+
+
+def _render_lakekeeper(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+    """Lakekeeper: Iceberg REST Catalog. Needs dedicated Postgres
+    DSN + LAKEKEEPER__BASE_URI (double-underscore, that's Lakekeeper's
+    nested-config separator convention) for absolute-URL generation in the
+    catalog responses (Iceberg clients follow these to reach the
+    metadata endpoints).
+
+    Fail-fast guard (same pattern as Meilisearch / HedgeDoc): empty
+    DB password crashes the Postgres init on first start with a
+    cryptic auth-failed log. Abort at deploy time with a clear
+    error pointing at the missing Tofu apply / Infisical sync.
+
+    LAKEKEEPER_DOMAIN is composed from BootstrapEnv.domain via
+    service_host so multi-tenant forks with subdomain_separator='-'
+    get the flat-subdomain hostname (lakekeeper-user1.example.com)
+    instead of lakekeeper.user1.example.com.
+    """
+    if _empty(c.lakekeeper_db_password):
+        raise ServiceEnvError(
+            "Lakekeeper enabled but LAKEKEEPER_DB_PASSWORD is empty — "
+            "run `tofu apply` (initial-setup workflow) to generate "
+            "random_password.lakekeeper_db_password + push to Infisical, "
+            "then re-run spin-up. Aborting to avoid a restart-looping "
+            "Postgres container with no auth.",
+        )
+    domain_host = service_host("lakekeeper", e.domain or "", e.subdomain_separator)
+    return RenderedEnv(
+        env_vars={
+            "LAKEKEEPER_DB_PASSWORD": c.lakekeeper_db_password or "",
+            "LAKEKEEPER_DOMAIN": domain_host,
+        },
+    )
+
+
+def _render_evidence(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+    """Evidence: SQL+markdown BI runtime. The bundled sample project
+    queries the in-stack Postgres via env-var interpolation, so we
+    pipe through the existing ``postgres_password`` field (no
+    dedicated Evidence secret to manage) plus the absolute public
+    URL Evidence uses for OG tags + canonical links.
+
+    No fail-fast guard: Evidence renders pages even without a working
+    data source (it just shows query errors inline), and the operator
+    may legitimately be wiring an external warehouse instead of the
+    in-stack Postgres. Leaving the password empty produces an
+    "auth failed" message on the affected query rather than a crashed
+    container.
+    """
+    domain_host = service_host("evidence", e.domain or "", e.subdomain_separator)
+    return RenderedEnv(
+        env_vars={
+            "POSTGRES_PASSWORD": c.postgres_password or "",
+            "EVIDENCE_BASE_URL": f"https://{domain_host}",
+        },
+    )
+
+
+def _render_litellm(
+    c: NexusConfig, e: BootstrapEnv, *, litellm_config_template: str | None = None
+) -> RenderedEnv:
+    """LiteLLM Proxy: env vars + a generated ``config.yaml`` sidecar
+    that maps OpenAI-compatible model names to backend providers.
+
+    The shipped ``config.yaml.template`` (in ``stacks/litellm/``) is the
+    operator-editable source of truth — committed to git, survives
+    spin-up cycles. The renderer copies it verbatim to the generated
+    ``config.yaml`` (gitignored, bind-mounted into the container).
+    Alternative operator workflow: add models via the /ui at runtime;
+    STORE_MODEL_IN_DB persists those in Postgres across restarts.
+
+    Template is normally injected by ``render_all_env_files`` (parallel
+    to Grafana's ``prometheus_template`` dispatch) so it works with
+    the repo checkout, with installed wheels, and with custom
+    stacks_dir fixtures. The ``_load_litellm_config_template()``
+    fallback is kept for direct test callers that bypass orchestration.
+
+    Fail-fast guard: master key + salt key + DB password must all be
+    set. Without master_key LiteLLM rejects all requests; without
+    salt_key the DB-stored derived keys can't be verified; without
+    db_password the Postgres init crashes.
+    """
+    if _empty(c.litellm_master_key) or _empty(c.litellm_salt_key) or _empty(c.litellm_db_password):
+        missing = [
+            name
+            for name, value in (
+                ("LITELLM_MASTER_KEY", c.litellm_master_key),
+                ("LITELLM_SALT_KEY", c.litellm_salt_key),
+                ("LITELLM_DB_PASSWORD", c.litellm_db_password),
+            )
+            if _empty(value)
+        ]
+        raise ServiceEnvError(
+            f"LiteLLM enabled but {', '.join(missing)} empty — run "
+            "`tofu apply` (initial-setup workflow) to generate the "
+            "random_password.litellm_master_key + random_password.litellm_salt_key + "
+            "random_password.litellm_db_password resources + push to "
+            "Infisical, then re-run spin-up. Aborting to avoid an "
+            "auth-bypass / DB-auth-failure container.",
+        )
+    config_yaml = (
+        litellm_config_template
+        if litellm_config_template is not None
+        else _load_litellm_config_template()
+    )
+    return RenderedEnv(
+        env_vars={
+            "LITELLM_MASTER_KEY": c.litellm_master_key or "",
+            "LITELLM_SALT_KEY": c.litellm_salt_key or "",
+            "LITELLM_DB_PASSWORD": c.litellm_db_password or "",
+            "LITELLM_UI_USERNAME": c.admin_username or "admin",
+        },
+        sidecars=(
+            # mode 0o644: bind-mounted into the litellm container which
+            # runs as non-root; the api_keys in this file (if any) are
+            # protected by the host-access barrier (SSH behind CF Tunnel
+            # + email OTP) just like .env files for other services.
+            SidecarFile(relative_path="config.yaml", content=config_yaml, mode=0o644),
+        ),
+    )
+
+
+def _load_litellm_config_template() -> str:
+    """Load ``stacks/litellm/config.yaml.template`` from the repo.
+
+    Resolved relative to this Python file. Tests can monkey-patch
+    this function to inject a fixture template (same pattern as
+    :func:`_load_prometheus_template`).
+    """
+    project_root = Path(__file__).resolve().parents[2]
+    template_path = project_root / "stacks" / "litellm" / "config.yaml.template"
+    return template_path.read_text(encoding="utf-8")
 
 
 def _render_mage(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
@@ -965,6 +1343,11 @@ _SPECS: tuple[EnvSpec, ...] = (
     EnvSpec("dagster", _is_enabled("dagster"), _render_dagster),
     EnvSpec("kestra", _is_enabled("kestra"), _render_kestra),
     EnvSpec("cloudbeaver", _is_enabled("cloudbeaver"), _render_cloudbeaver),
+    EnvSpec("meilisearch", _is_enabled("meilisearch"), _render_meilisearch),
+    EnvSpec("hedgedoc", _is_enabled("hedgedoc"), _render_hedgedoc),
+    EnvSpec("litellm", _is_enabled("litellm"), _render_litellm),
+    EnvSpec("lakekeeper", _is_enabled("lakekeeper"), _render_lakekeeper),
+    EnvSpec("evidence", _is_enabled("evidence"), _render_evidence),
     EnvSpec("mage", _is_enabled("mage"), _render_mage),
     EnvSpec("minio", _is_enabled("minio"), _render_minio),
     EnvSpec("sftpgo", _is_enabled("sftpgo"), _render_sftpgo),
@@ -1071,6 +1454,49 @@ def render_all_env_files(
     """
     results: list[ServiceRenderResult] = []
     spark_enabled = "spark" in enabled
+    # Grafana renders ``prometheus.yml`` from a template that lives
+    # alongside the docker-compose at ``stacks_dir/grafana/``. Read it
+    # ONCE here so the renderer stays a pure (config, env) → result
+    # function and operationally works regardless of where the package
+    # was installed from. If grafana is enabled, the template MUST be
+    # in stacks_dir — silent fallback to a repo-relative loader would
+    # either fail with a confusing site-packages path or render from
+    # a totally different file than the operator is editing.
+    prometheus_template: str | None = None
+    if "grafana" in enabled:
+        template_path = stacks_dir / "grafana" / "prometheus.yml.template"
+        try:
+            prometheus_template = template_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ServiceEnvError(
+                f"grafana enabled but prometheus.yml.template is unreadable at "
+                f"{template_path} ({type(exc).__name__}). The template ships with "
+                "stacks/grafana/ and must be present in the stacks_dir passed to "
+                "render_all_env_files. Restore the file (re-clone the repo or "
+                "git checkout stacks/grafana/prometheus.yml.template) or disable "
+                "grafana before retrying.",
+            ) from exc
+
+    # LiteLLM: same template-loading pattern as Grafana — config.yaml
+    # lives at stacks_dir/litellm/config.yaml.template (operator-editable
+    # source of truth) and the renderer copies it to the generated
+    # config.yaml. Fail-fast if grafana-style: template MUST be present
+    # when the service is enabled.
+    litellm_config_template: str | None = None
+    if "litellm" in enabled:
+        litellm_template_path = stacks_dir / "litellm" / "config.yaml.template"
+        try:
+            litellm_config_template = litellm_template_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ServiceEnvError(
+                f"litellm enabled but config.yaml.template is unreadable at "
+                f"{litellm_template_path} ({type(exc).__name__}). The template "
+                "ships with stacks/litellm/ and must be present in the "
+                "stacks_dir passed to render_all_env_files. Restore the file "
+                "(re-clone the repo or git checkout "
+                "stacks/litellm/config.yaml.template) or disable litellm "
+                "before retrying.",
+            ) from exc
 
     for spec in _SPECS:
         if not spec.enabled_check(enabled):
@@ -1079,9 +1505,14 @@ def render_all_env_files(
             )
             continue
 
-        # Cross-spec dependencies: jupyter needs spark_enabled.
+        # Cross-spec dependencies: jupyter needs spark_enabled, grafana
+        # needs the prometheus.yml.template loaded from stacks_dir.
         if spec.service_name == "jupyter":
             rendered = _render_jupyter(config, env, spark_enabled=spark_enabled)
+        elif spec.service_name == "grafana":
+            rendered = _render_grafana(config, env, prometheus_template=prometheus_template)
+        elif spec.service_name == "litellm":
+            rendered = _render_litellm(config, env, litellm_config_template=litellm_config_template)
         else:
             rendered = spec.render(config, env)
 

@@ -75,4 +75,12 @@ networks:
   app-network:
     external: true
   ollama-internal:
-    driver: bridge
+    # Treated as external on both sides (here and in stacks/litellm). The
+    # deploy pipeline pre-creates `ollama-internal` whenever either stack
+    # is enabled (see compose_runner.render_remote_script's
+    # `ollama_internal_network_prep` block), so network ownership lives
+    # outside both compose projects. This keeps the joint Ollama+LiteLLM
+    # deployment deterministic — neither compose project tries to "own"
+    # the network and race on creation.
+    external: true
+    name: ollama-internal

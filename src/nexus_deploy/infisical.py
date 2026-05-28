@@ -85,6 +85,18 @@ class BootstrapEnv:
     # f-strings always interpolate it; the tfvars parser normalises
     # an empty value to ``"."``.
     subdomain_separator: str = "."
+    # Issue #607: optional Prometheus ``remote_write`` target for
+    # centralised cross-stack monitoring (see Nexus-Conductor #23).
+    # When both ``monitoring_endpoint`` and ``monitoring_token`` are
+    # set, the grafana stack renders a ``prometheus.yml`` with a
+    # ``remote_write`` block pointing at ``<endpoint>/api/v1/write``
+    # with a Bearer token; otherwise it renders today's no-remote_write
+    # variant. ``tenant_id`` defaults to ``domain`` when empty — vmauth
+    # enforces tenant labels server-side from the token mapping anyway,
+    # so the relabel rule we inject is informational defense-in-depth.
+    monitoring_endpoint: str | None = None
+    monitoring_token: str | None = None
+    tenant_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -633,6 +645,51 @@ def compute_folders(config: NexusConfig, env: BootstrapEnv) -> list[FolderSpec]:
                 {
                     "CLOUDBEAVER_USERNAME": "nexus-cloudbeaver",
                     "CLOUDBEAVER_PASSWORD": config.cloudbeaver_admin_password,
+                }
+            ),
+        )
+    )
+    folders.append(
+        FolderSpec(
+            "meilisearch",
+            _filter_empty(
+                {
+                    "MEILISEARCH_MASTER_KEY": config.meilisearch_master_key,
+                }
+            ),
+        )
+    )
+    folders.append(
+        FolderSpec(
+            "hedgedoc",
+            _filter_empty(
+                {
+                    "HEDGEDOC_USERNAME": env.admin_email,
+                    "HEDGEDOC_PASSWORD": config.hedgedoc_admin_password,
+                    "HEDGEDOC_SESSION_SECRET": config.hedgedoc_session_secret,
+                    "HEDGEDOC_DB_PASSWORD": config.hedgedoc_db_password,
+                }
+            ),
+        )
+    )
+    folders.append(
+        FolderSpec(
+            "litellm",
+            _filter_empty(
+                {
+                    "LITELLM_MASTER_KEY": config.litellm_master_key,
+                    "LITELLM_SALT_KEY": config.litellm_salt_key,
+                    "LITELLM_DB_PASSWORD": config.litellm_db_password,
+                }
+            ),
+        )
+    )
+    folders.append(
+        FolderSpec(
+            "lakekeeper",
+            _filter_empty(
+                {
+                    "LAKEKEEPER_DB_PASSWORD": config.lakekeeper_db_password,
                 }
             ),
         )

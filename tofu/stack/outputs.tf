@@ -30,14 +30,14 @@ output "ssh_firewall_id" {
 
 output "ssh_command" {
   description = "SSH command via Cloudflare Tunnel (requires cloudflared locally)"
-  value       = "cloudflared access ssh --hostname ssh-michael-kronenberg.nona.company"
+  value       = "cloudflared access ssh --hostname ssh.${var.domain}"
 }
 
 output "ssh_config" {
   description = "Add this to ~/.ssh/config for easy access"
   value       = <<-EOT
     Host nexus
-      HostName ssh-michael-kronenberg.nona.company
+      HostName ssh.${var.domain}
       User root
       ProxyCommand cloudflared access ssh --hostname %h
   EOT
@@ -82,7 +82,7 @@ output "service_urls" {
   description = "URLs for all enabled services with a subdomain"
   value = {
     for key, service in local.enabled_services_with_subdomain :
-    key => "https://${service.subdomain}-michael-kronenberg.nona.company"
+    key => "https://${service.subdomain}.${var.domain}"
   }
 }
 
@@ -156,6 +156,22 @@ output "secrets" {
     # CloudBeaver
     cloudbeaver_admin_password = random_password.cloudbeaver_admin.result
 
+    # Meilisearch
+    meilisearch_master_key = random_password.meilisearch_master_key.result
+
+    # HedgeDoc
+    hedgedoc_session_secret = random_password.hedgedoc_session_secret.result
+    hedgedoc_db_password    = random_password.hedgedoc_db_password.result
+    hedgedoc_admin_password = random_password.hedgedoc_admin.result
+
+    # LiteLLM Proxy
+    litellm_master_key  = random_password.litellm_master_key.result
+    litellm_salt_key    = random_password.litellm_salt_key.result
+    litellm_db_password = random_password.litellm_db_password.result
+
+    # Lakekeeper (Iceberg REST Catalog)
+    lakekeeper_db_password = random_password.lakekeeper_db_password.result
+
     # ClickHouse
     clickhouse_admin_password = random_password.clickhouse_admin.result
 
@@ -196,8 +212,8 @@ output "secrets" {
 
     # RedPanda SASL (for external Kafka access)
     redpanda_admin_password             = random_password.redpanda_admin.result
-    redpanda_kafka_public_url           = "redpanda-kafka-michael-kronenberg.nona.company:9092"
-    redpanda_schema_registry_public_url = "http://redpanda-schema-registry-michael-kronenberg.nona.company:18081"
+    redpanda_kafka_public_url           = "redpanda-kafka.${var.domain}:9092"
+    redpanda_schema_registry_public_url = "http://redpanda-schema-registry.${var.domain}:18081"
 
     # RustFS
     rustfs_root_password = random_password.rustfs_root.result

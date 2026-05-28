@@ -137,6 +137,68 @@ resource "random_password" "cloudbeaver_admin" {
   special = false
 }
 
+# Meilisearch master key — gates ALL API endpoints (read + write +
+# admin). Generated with longer length (32) because the master key
+# is the only auth layer between requesters and the index data;
+# Meilisearch derives per-tenant API keys from this root.
+resource "random_password" "meilisearch_master_key" {
+  length  = 32
+  special = false
+}
+
+# HedgeDoc session secret — signs the session cookie. 32 chars
+# (HedgeDoc docs recommend >=32 random bytes).
+resource "random_password" "hedgedoc_session_secret" {
+  length  = 32
+  special = false
+}
+
+# HedgeDoc Postgres password — dedicated DB, not shared.
+resource "random_password" "hedgedoc_db_password" {
+  length  = 24
+  special = false
+}
+
+# HedgeDoc admin password — single seeded account that the deploy
+# pipeline creates via `node /hedgedoc/bin/manage_users --add ...
+# --pass ...` post-compose-up. With CMD_ALLOW_EMAIL_REGISTER=false
+# this is the ONLY way to authenticate into HedgeDoc; CF Access at
+# the edge gates "who can reach the login page" but is not the
+# in-app identity.
+resource "random_password" "hedgedoc_admin" {
+  length  = 24
+  special = false
+}
+
+# LiteLLM master key — Bearer token for admin ops + /ui login.
+# Length 32 because it's the single auth gate to every provider
+# proxied behind it (Ollama, OpenAI, Anthropic, ...).
+resource "random_password" "litellm_master_key" {
+  length  = 32
+  special = false
+}
+
+# LiteLLM salt key — hashes derived API keys before storing in DB.
+# Operator can rotate to invalidate all student-issued keys at once.
+resource "random_password" "litellm_salt_key" {
+  length  = 32
+  special = false
+}
+
+# LiteLLM Postgres password — dedicated DB, not shared.
+resource "random_password" "litellm_db_password" {
+  length  = 24
+  special = false
+}
+
+# Lakekeeper Postgres password — dedicated DB, not shared. The
+# catalog metadata (warehouses, namespaces, table pointers) lives
+# in this DB; the actual Parquet data goes to object storage.
+resource "random_password" "lakekeeper_db_password" {
+  length  = 24
+  special = false
+}
+
 # Mage AI admin password
 resource "random_password" "mage_admin" {
   length  = 24
@@ -607,7 +669,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
   config {
     # SSH access
     ingress_rule {
-      hostname = "ssh-michael-kronenberg.nona.company"
+      hostname = "ssh.${var.domain}"
       service  = "ssh://localhost:22"
     }
 
@@ -615,7 +677,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
     dynamic "ingress_rule" {
       for_each = local.enabled_services_with_subdomain
       content {
-        hostname = "${ingress_rule.value.subdomain}-michael-kronenberg.nona.company"
+        hostname = "${ingress_rule.value.subdomain}.${var.domain}"
         service  = "http://localhost:${ingress_rule.value.port}"
       }
     }
@@ -633,7 +695,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
 
 resource "cloudflare_record" "ssh" {
   zone_id = var.cloudflare_zone_id
-  name    = "ssh-michael-kronenberg"
+  name    = "ssh"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -647,7 +709,7 @@ resource "cloudflare_record" "services" {
   depends_on = [cloudflare_zero_trust_tunnel_cloudflared_config.main]
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.subdomain}-michael-kronenberg"
+  name    = each.value.subdomain
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -671,7 +733,7 @@ resource "cloudflare_record" "firewall_tcp" {
   for_each = var.ipv6_only ? {} : local.firewall_dns_records
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.dns_record}-michael-kronenberg"
+  name    = each.value.dns_record
   content = hcloud_server.main.ipv4_address
   type    = "A"
   proxied = false
@@ -686,7 +748,7 @@ resource "cloudflare_record" "firewall_tcp" {
 resource "cloudflare_zero_trust_access_application" "ssh" {
   zone_id          = var.cloudflare_zone_id
   name             = "${local.resource_prefix} SSH"
-  domain           = "ssh-michael-kronenberg.nona.company"
+  domain           = "ssh.${var.domain}"
   type             = "ssh"
   session_duration = "1h"
 }
@@ -759,7 +821,7 @@ resource "cloudflare_zero_trust_access_application" "services" {
 
   zone_id = var.cloudflare_zone_id
   name    = "${local.resource_prefix} ${title(each.key)}"
-  domain  = "${each.value.subdomain}-michael-kronenberg.nona.company"
+  domain  = "${each.value.subdomain}.${var.domain}"
   type    = "self_hosted"
   # Wetty uses shorter session duration (1h) for enhanced security
   # Other services use 24h for better user experience
